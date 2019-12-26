@@ -146,6 +146,18 @@ def sync_blocks(rpc_connections, *, wait=1, timeout=60):
     raise AssertionError("Block sync to height {} timed out:{}".format(
                          maxheight, "".join("\n  {!r}".format(tip) for tip in tips)))
 
+def sync_znodes(rpc_connections, *, timeout=60):
+    """
+    Waits until every node has their znsync status is synced.
+    """
+    start_time = cur_time = time.time()
+    while cur_time <= start_time + timeout:
+        statuses = [r.znsync("status") for r in rpc_connections]
+        if all(stat["IsSynced"] == True for stat in statuses):
+            return
+        cur_time = time.time()
+    raise AssertionError("Znode sync failed.")
+
 def sync_chain(rpc_connections, *, wait=1, timeout=60):
     """
     Wait until everybody has the same best block
@@ -248,7 +260,7 @@ def initialize_chain(test_dir, num_nodes, cachedir):
 
         # Create cache directories, run bitcoinds:
         for i in range(MAX_NODES):
-            datadir=initialize_datadir("cache", i)
+            datadir=initialize_datadir(cachedir, i)
             args = [ os.getenv("ZCOIND", "zcoind"), "-server", "-keypool=1", "-datadir="+datadir, "-discover=0" ]
             if i > 0:
                 args.append("-connect=127.0.0.1:"+str(p2p_port(0)))
@@ -289,15 +301,19 @@ def initialize_chain(test_dir, num_nodes, cachedir):
         stop_nodes(rpcs)
         disable_mocktime()
         for i in range(MAX_NODES):
-            os.remove(log_filename(cachedir, i, "debug.log"))
-            os.remove(log_filename(cachedir, i, "db.log"))
-            os.remove(log_filename(cachedir, i, "peers.dat"))
-            os.remove(log_filename(cachedir, i, "fee_estimates.dat"))
+            try:
+                os.remove(log_filename(cachedir, i, "debug.log"))
+                os.remove(log_filename(cachedir, i, "db.log"))
+                os.remove(log_filename(cachedir, i, "peers.dat"))
+                os.remove(log_filename(cachedir, i, "fee_estimates.dat"))
+            except OSError:
+                pass
 
     for i in range(num_nodes):
         from_dir = os.path.join(cachedir, "node"+str(i))
         to_dir = os.path.join(test_dir,  "node"+str(i))
-        shutil.copytree(from_dir, to_dir)
+        if from_dir != to_dir:
+            shutil.copytree(from_dir, to_dir)
         initialize_datadir(test_dir, i) # Overwrite port/rpcport in bitcoin.conf
 
 def initialize_chain_clean(test_dir, num_nodes):
@@ -336,7 +352,7 @@ def start_node(i, dirname, extra_args=None, rpchost=None, timewait=None, binary=
     datadir = os.path.join(dirname, "node"+str(i))
     if binary is None:
         binary = os.getenv("ZCOIND", "zcoind")
-    args = [ binary, "-datadir="+datadir, "-server", "-keypool=1", "-discover=0", "-rest", "-dandelion=0", "-mocktime="+str(get_mocktime()) ]
+    args = [ binary, "-datadir="+datadir, "-server", "-keypool=1", "-discover=0", "-rest", "-dandelion=0", "-usemnemonic=0", "-mocktime="+str(get_mocktime()) ]
     if extra_args is not None: args.extend(extra_args)
     print("Starting a process with: " + " ".join(args))
     bitcoind_processes[i] = subprocess.Popen(args)

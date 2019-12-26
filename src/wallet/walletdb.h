@@ -10,6 +10,7 @@
 #include "primitives/transaction.h"
 #include "primitives/zerocoin.h"
 #include "wallet/db.h"
+#include "mnemoniccontainer.h"
 #include "streams.h"
 #include "key.h"
 
@@ -31,6 +32,8 @@
 #include <boost/lexical_cast.hpp>
 
 static const bool DEFAULT_FLUSHWALLET = true;
+static const uint32_t ORIGINAL_KEYPATH_SIZE = 0x4; // m/0'/0'/<n> is the original keypath
+static const uint32_t BIP44_KEYPATH_SIZE = 0x6;    // m/44'/<1/136>'/0'/<c>/<n> is the BIP44 keypath
 
 class CAccount;
 class CAccountingEntry;
@@ -71,7 +74,8 @@ public:
 
     static const int VERSION_BASIC = 1;
     static const int VERSION_WITH_BIP44 = 10;
-    static const int CURRENT_VERSION = VERSION_WITH_BIP44;
+    static const int VERSION_WITH_BIP39 = 11;
+    static const int CURRENT_VERSION = VERSION_WITH_BIP39;
     static const int N_CHANGES = 4; // standard = 0/1, mint = 2, exodus = 3
     int nVersion;
 
@@ -126,9 +130,16 @@ public:
 
     bool ParseComponents(){
         std::vector<std::string> nComponents;
-        if (hdKeypath.empty() || hdKeypath=="m")
+        if(hdKeypath.empty())
             return false;
+        if(hdKeypath=="m")
+            return true;
+
         boost::split(nComponents, hdKeypath, boost::is_any_of("/"), boost::token_compress_on);
+        if(nComponents.size()!=ORIGINAL_KEYPATH_SIZE &&
+           nComponents.size()!=BIP44_KEYPATH_SIZE)
+            return false;
+
         std::string nChangeStr = nComponents[nComponents.size()-2];
         std::string nChildStr  = nComponents[nComponents.size()-1];
 
@@ -283,6 +294,7 @@ public:
 
     //! write the hdchain model (external chain child index counter)
     bool WriteHDChain(const CHDChain& chain);
+    bool WriteMnemonic(const MnemonicContainer& mnContainer);
 
 #ifdef ENABLE_EXODUS
 
@@ -359,19 +371,19 @@ public:
             throw runtime_error(std::string(__func__)+" : cannot create DB cursor");
         }
 
-        unsigned int flags = DB_SET_RANGE;
+        bool setRange = true;
         while (true) {
 
             // Read next record
             CDataStream ssKey(SER_DISK, CLIENT_VERSION);
-            if (flags == DB_SET_RANGE) {
+            if (setRange) {
                 ssKey << std::make_pair(string("exodus_mint"), K());
             }
 
             CDataStream ssValue(SER_DISK, CLIENT_VERSION);
-            int ret = ReadAtCursor(cursor, ssKey, ssValue, flags);
+            int ret = ReadAtCursor(cursor, ssKey, ssValue, setRange);
 
-            flags = DB_NEXT;
+            setRange = false;
             if (ret == DB_NOTFOUND) {
                 break;
             } else if (ret != 0) {

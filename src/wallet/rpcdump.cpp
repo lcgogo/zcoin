@@ -108,6 +108,13 @@ UniValue importprivkey(const JSONRPCRequest& request)
 
     EnsureWalletIsUnlocked();
 
+    const CHDChain& chain = pwalletMain->GetHDChain();
+    if(chain.nVersion == chain.VERSION_WITH_BIP39){
+        throw JSONRPCError(RPC_WALLET_ERROR, "Importing wallets and private keys is disabled for mnemonic-enabled wallets."
+                                             "To import your dump file, create a non-mnemonic wallet by setting \"usemnemonic=0\" in your zcoin.conf file, after backing up and removing your existing wallet.");
+    }
+
+
     string strSecret = request.params[0].get_str();
     string strLabel = "";
     if (request.params.size() > 1)
@@ -436,6 +443,13 @@ UniValue importwallet(const JSONRPCRequest& request)
 
     EnsureWalletIsUnlocked();
 
+    const CHDChain& chain = pwalletMain->GetHDChain();
+    if(chain.nVersion == chain.VERSION_WITH_BIP39){
+        throw JSONRPCError(RPC_WALLET_ERROR, "Importing wallets and private keys is disabled for mnemonic-enabled wallets."
+                                             "To import your dump file, create a non-mnemonic wallet by setting \"usemnemonic=0\" in your zcoin.conf file, after backing up and removing your existing wallet.");
+    }
+
+
     ifstream file;
     file.open(request.params[0].get_str().c_str(), std::ios::in | std::ios::ate);
     if (!file.is_open())
@@ -451,6 +465,7 @@ UniValue importwallet(const JSONRPCRequest& request)
     file.seekg(0, file.beg);
 
     CWalletDB walletdb(pwalletMain->strWalletFile);
+    CKeyID masterKeyID = pwalletMain->GetHDChain().masterKeyID;
 
     pwalletMain->ShowProgress(_("Importing..."), 0); // show progress dialog in GUI
     while (file.good()) {
@@ -475,10 +490,11 @@ UniValue importwallet(const JSONRPCRequest& request)
             zerocoinEntry.IsUsed = stoi(vstr[5]);
             zerocoinEntry.nHeight = stoi(vstr[6]);
             zerocoinEntry.id = stoi(vstr[7]);
-            if(vstr.size()>8){
+            if(vstr.size()==11){ // Including the last "#"
                 zerocoinEntry.ecdsaSecretKey = ParseHex(vstr[8]);
                 zerocoinEntry.IsUsedForRemint = stoi(vstr[9]);
             }
+            pwalletMain->NotifyZerocoinChanged(pwalletMain, zerocoinEntry.value.GetHex(), "New (" + std::to_string(zerocoinEntry.denomination) + " mint)", CT_NEW);
             walletdb.WriteZerocoinEntry(zerocoinEntry);
         }
         else {
@@ -505,7 +521,7 @@ UniValue importwallet(const JSONRPCRequest& request)
                     break;
                 if (vstr[nStr] == "change=1")
                     fLabel = false;
-                if (vstr[nStr] == "sigma=1")
+                if (!masterKeyID.IsNull() && vstr[nStr] == "sigma=1")
                     fLabel = false;
                 if (vstr[nStr] == "reserve=1")
                     fLabel = false;
@@ -513,22 +529,24 @@ UniValue importwallet(const JSONRPCRequest& request)
                     strLabel = DecodeDumpString(vstr[nStr].substr(6));
                     fLabel = true;
                 }
-                if(boost::algorithm::starts_with(vstr[nStr], "hdKeypath=")){
+                if(!masterKeyID.IsNull() && boost::algorithm::starts_with(vstr[nStr], "hdKeypath=")){
                     hdKeypath = vstr[nStr].substr(10);
                     fHd = true;
                 }
-                if(boost::algorithm::starts_with(vstr[nStr], "hdMasterKeyID=")){
+                if(!masterKeyID.IsNull() && boost::algorithm::starts_with(vstr[nStr], "hdMasterKeyID=")){
                     hdMasterKeyID.SetHex(vstr[nStr].substr(14));
                 }
             }
             LogPrintf("Importing %s...\n", CBitcoinAddress(keyid).ToString());
 
             // Add entry to mapKeyMetadata (Need to populate KeyMetadata before for it to be written to DB in the following call)
-            pwalletMain->mapKeyMetadata[keyid].nCreateTime = nTime;
-            if(fHd){
-                pwalletMain->mapKeyMetadata[keyid].hdKeypath = hdKeypath;
-                pwalletMain->mapKeyMetadata[keyid].hdMasterKeyID = hdMasterKeyID;
-                pwalletMain->mapKeyMetadata[keyid].ParseComponents();
+            if(!masterKeyID.IsNull()){
+                pwalletMain->mapKeyMetadata[keyid].nCreateTime = nTime;
+                if(fHd){
+                    pwalletMain->mapKeyMetadata[keyid].hdKeypath = hdKeypath;
+                    pwalletMain->mapKeyMetadata[keyid].hdMasterKeyID = hdMasterKeyID;
+                    pwalletMain->mapKeyMetadata[keyid].ParseComponents();
+                }
             }
 
             if (!pwalletMain->AddKeyPubKey(key, pubkey)) {
@@ -536,7 +554,7 @@ UniValue importwallet(const JSONRPCRequest& request)
                 continue;
             }
 
-            if(fHd){
+            if(!masterKeyID.IsNull() && fHd){
                 // If change component in HD path is 2, this is a mint seed key. Add to mintpool. (Have to call after key addition)
                 if(pwalletMain->mapKeyMetadata[keyid].nChange.first==2){
                     zwalletMain->RegenerateMintPoolEntry(hdMasterKeyID, keyid, pwalletMain->mapKeyMetadata[keyid].nChild.first);
@@ -699,9 +717,35 @@ UniValue dumpwallet(const JSONRPCRequest& request)
     file << strprintf("#   mined on %s\n", EncodeDumpTime(chainActive.Tip()->GetBlockTime()));
     file << "\n";
 
-    // add the base58check encoded extended master if the wallet uses HD 
-    CKeyID masterKeyID = pwalletMain->GetHDChain().masterKeyID;
-    if (!masterKeyID.IsNull())
+    // add the base58check encoded extended master if the wallet uses HD
+    MnemonicContainer mContainer = pwalletMain->GetMnemonicContainer();
+    const CHDChain& chain = pwalletMain->GetHDChain();
+    CKeyID masterKeyID = chain.masterKeyID;
+    if(!mContainer.IsNull() && chain.nVersion >= CHDChain::VERSION_WITH_BIP39)
+    {
+        if(mContainer.IsCrypted())
+        {
+            if(!pwalletMain->DecryptMnemonicContainer(mContainer))
+                throw JSONRPCError(RPC_INTERNAL_ERROR, "Cannot decrypt hd chain");
+        }
+
+        SecureString mnemonic;
+        //Don't dump mnemonic words in case user has set only hd seed during wallet creation
+        if(mContainer.GetMnemonic(mnemonic))
+            file << "# mnemonic: " << mnemonic << "\n";
+
+        SecureVector seed = mContainer.GetSeed();
+        file << "# HD seed: " << HexStr(seed) << "\n\n";
+
+        CExtKey masterKey;
+        masterKey.SetMaster(&seed[0], seed.size());
+
+        CBitcoinExtKey b58extkey;
+        b58extkey.SetKey(masterKey);
+
+        file << "# extended private masterkey: " << b58extkey.ToString() << "\n";
+    }
+    else if (!masterKeyID.IsNull())
     {
         CKey key;
         if (pwalletMain->GetKey(masterKeyID, key))
@@ -720,7 +764,10 @@ UniValue dumpwallet(const JSONRPCRequest& request)
         std::string strTime = EncodeDumpTime(it->first);
         std::string strAddr = CBitcoinAddress(keyid).ToString();
         CKey key;
-        pwalletMain->mapKeyMetadata[keyid].ParseComponents();
+        if(!masterKeyID.IsNull()){
+            if(!pwalletMain->mapKeyMetadata[keyid].ParseComponents())
+                continue;
+        }
         if (pwalletMain->GetKey(keyid, key)) {
             file << strprintf("%s %s ", CBitcoinSecret(key).ToString(), strTime);
             if (pwalletMain->mapAddressBook.count(keyid)) {
@@ -729,21 +776,23 @@ UniValue dumpwallet(const JSONRPCRequest& request)
                 file << "hdmaster=1";
             } else if (setKeyPool.count(keyid)) {
                 file << "reserve=1";
-            } else if (pwalletMain->mapKeyMetadata[keyid].hdKeypath == "m") {
+            } else if (!masterKeyID.IsNull() && pwalletMain->mapKeyMetadata[keyid].hdKeypath == "m") {
                 file << "inactivehdmaster=1";
-            } else if (pwalletMain->mapKeyMetadata[keyid].nChange.first == 2) {
+            } else if (!masterKeyID.IsNull() && pwalletMain->mapKeyMetadata[keyid].nChange.first == 2) {
                 file << "sigma=1";
             } else {
                 file << "change=1";
             }
-            if(pwalletMain->mapKeyMetadata.find(keyid) != pwalletMain->mapKeyMetadata.end()){
-                if(pwalletMain->mapKeyMetadata[keyid].nVersion >= CKeyMetadata::VERSION_WITH_HDDATA){
-                    string hdKeypath = pwalletMain->mapKeyMetadata[keyid].hdKeypath;
-                    uint160 hdMasterKeyID = pwalletMain->mapKeyMetadata[keyid].hdMasterKeyID;
-                    if(hdKeypath != "")
-                        file << strprintf(" hdKeypath=%s", hdKeypath);
-                    if(!hdMasterKeyID.IsNull())
-                        file << strprintf(" hdMasterKeyID=%s", hdMasterKeyID.ToString());
+            if(!masterKeyID.IsNull()){
+                if(pwalletMain->mapKeyMetadata.find(keyid) != pwalletMain->mapKeyMetadata.end()){
+                    if(pwalletMain->mapKeyMetadata[keyid].nVersion >= CKeyMetadata::VERSION_WITH_HDDATA){
+                        string hdKeypath = pwalletMain->mapKeyMetadata[keyid].hdKeypath;
+                        uint160 hdMasterKeyID = pwalletMain->mapKeyMetadata[keyid].hdMasterKeyID;
+                        if(hdKeypath != "")
+                            file << strprintf(" hdKeypath=%s", hdKeypath);
+                        if(!hdMasterKeyID.IsNull())
+                            file << strprintf(" hdMasterKeyID=%s", hdMasterKeyID.ToString());
+                    }
                 }
             }
             file << strprintf(" # addr=%s\n", strAddr);

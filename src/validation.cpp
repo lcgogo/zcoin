@@ -3334,6 +3334,20 @@ bool ActivateBestChain(CValidationState &state, const CChainParams& chainparams,
         return false;
     }
 
+    //clear all old sigma spend transaction from mempool, to stat padding
+    if (chainActive.Height() == ::Params().GetConsensus().nSigmaPaddingBlock) {
+        LOCK2(cs_main, mempool.cs);
+        for (CTxMemPool::indexed_transaction_set::iterator mi = mempool.mapTx.begin();
+             mi != mempool.mapTx.end(); ++mi)
+        {
+            auto tx = mi->GetTx();
+            if(tx.IsSigmaSpend()) {
+                std::list<CTransaction> removed;
+                mempool.removeRecursive(tx, MemPoolRemovalReason::CONFLICT);
+            }
+        }
+    }
+
     return true;
 }
 
@@ -3833,7 +3847,6 @@ bool ContextualCheckBlockHeader(const CBlockHeader& block, CValidationState& sta
     if (block.IsMTP() != fBlockHasMTP)
 		return state.Invalid(false, REJECT_OBSOLETE, strprintf("bad-version(0x%08x)", block.nVersion),strprintf("rejected nVersion=0x%08x block", block.nVersion));
 
-    const int nHeight = pindexPrev == NULL ? 0 : pindexPrev->nHeight + 1;
 	// Check proof of work
     if (block.nBits != GetNextWorkRequired(pindexPrev, &block, consensusParams))
         return state.DoS(100, false, REJECT_INVALID, "bad-diffbits", false, "incorrect proof of work");
@@ -4078,7 +4091,7 @@ static bool AcceptBlock(const std::shared_ptr<const CBlock>& pblock, CValidation
     }
     if (fNewBlock) *fNewBlock = true;
 
-    if (!CheckBlock(block, state, chainparams.GetConsensus(), true, pindex->nHeight, false) ||
+    if (!CheckBlock(block, state, chainparams.GetConsensus(), true, true, pindex->nHeight, false) ||
         !ContextualCheckBlock(block, state, chainparams.GetConsensus(), pindex->pprev)) {
         if (state.IsInvalid() && !state.CorruptionPossible()) {
             pindex->nStatus |= BLOCK_FAILED_VALID;
@@ -4858,12 +4871,12 @@ bool LoadExternalBlockFile(const CChainParams& chainparams, FILE* fileIn, CDiskB
                 }
 
                 // Activate the genesis block so normal node progress can continue
-                if (hash == chainparams.GetConsensus().hashGenesisBlock) {
+// We should call it for every block as our tx verification algos rely on the real block heights.
+//                if (hash == chainparams.GetConsensus().hashGenesisBlock) {
                     CValidationState state;
                     if (!ActivateBestChain(state, chainparams)) {
                         break;
                     }
-                }
 
                 NotifyHeaderTip();
 
